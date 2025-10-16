@@ -1,0 +1,17 @@
+streamlit>=1.30.0
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-chroma>=0.1.0
+# chromadb>=0.4.20
+ollama>=0.1.0
+docling>=0.1.0
+unstructured>=0.13.0
+unstructured[pdf]>=0.13.0
+unstructured[ocr]>=0.13.0
+langchain-experimental>=0.0.50
+scikit-learn>=1.3.0
+rank-bm25>=0.2.2
+presidio-analyzer>=2.2.35
+presidio-anonymizer>=2.2.35
+spacy>=3.7.0
+tqdm>=4.66.0

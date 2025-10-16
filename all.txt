@@ -1,0 +1,712 @@
+"""
+🚀 Main Streamlit App: PDF RAG Playground.
+Beginner-friendly UI with expert-level backend.
+"""
+
+import streamlit as st
+import os
+import tempfile
+from pathlib import Path
+from typing import List
+from config import DEFAULT_CONFIG
+from utils import check_ollama_connection, logger
+from pdf_processor import docling_chunks_from_pdfs
+from rag_engine import setup_rag_chain, expand_query
+
+# Initialize session state
+for key in ["chat_history", "rag_chain", "base_retriever", "vectorstore", "llm", "documents_loaded"]:
+    if key not in st.session_state:
+        st.session_state[key] = [] if key == "chat_history" else None
+
+st.set_page_config(page_title="📚 PDF RAG Playground", page_icon="📚", layout="wide")
+st.title("📚 PDF RAG Playground")
+st.caption("Local AI + Smart PDFs + Vector Search — All on your machine!")
+
+# ======================
+# SIDEBAR CONFIGURATION
+# ======================
+with st.sidebar:
+    st.header("⚙️ Configuration")
+
+    # Connection Check
+    with st.expander("🔌 Ollama Status", expanded=True):
+        if st.button("Check Connection"):
+            with st.spinner("Testing..."):
+                if check_ollama_connection(DEFAULT_CONFIG["embedding_model"]):
+                    st.success("✅ Ollama is ready!")
+                else:
+                    st.error("❌ Start Ollama: `ollama serve`")
+
+    # Storage
+    use_persistent = st.checkbox("💾 Persistent Storage", value=True)
+    storage_path = st.text_input(
+        "Storage Path",
+        value=os.path.join(os.getcwd(), "chromadb_storage") if use_persistent else "",
+        disabled=not use_persistent
+    ) if use_persistent else None
+
+    # LLM & Embeddings
+    llm_model = st.text_input("🤖 LLM Model", value=DEFAULT_CONFIG["llm_model"])
+    temperature = st.slider("🌡️ Temperature", 0.0, 1.0, DEFAULT_CONFIG["temperature"])
+    max_tokens = st.slider("📝 Max Tokens", 128, 2048, DEFAULT_CONFIG["max_tokens"])
+    embedding_model = st.text_input("🔗 Embedding Model", value=DEFAULT_CONFIG["embedding_model"])
+
+    # Chunking
+    chunking_method = st.selectbox("✂️ Chunking Method", ["docling", "recursive", "semantic", "llm_powered", "hybrid"])
+    chunk_size = st.slider("📏 Chunk Size", 128, 2048, DEFAULT_CONFIG["chunk_size"])
+    chunk_overlap = st.slider("🔗 Overlap", 0, 512, DEFAULT_CONFIG["chunk_overlap"])
+    use_hierarchical_retrieval = st.checkbox("📚 Hierarchical Retrieval")
+    proposition_extraction = st.checkbox("🧠 Proposition Extraction")
+    multimodal_enabled = st.checkbox("🖼️ Multimodal (Tables/Images)")
+
+    # Retrieval
+    retrieval_k = st.slider("🔍 Top K", 1, 10, DEFAULT_CONFIG["retrieval_k"])
+    search_type = st.selectbox("🔎 Search Type", ["mmr", "similarity", "similarity_score_threshold"])
+    similarity_threshold = st.slider("📉 Threshold", 0.0, 1.0, 0.3) if search_type == "similarity_score_threshold" else 0.3
+    use_reranking = st.checkbox("🎯 Reranking (slower)")
+    use_query_expansion = st.checkbox("🔍 Query Expansion (slower)")
+
+    # Document Processing
+    ocr_enabled = st.checkbox("🖼️ Enable OCR (scanned PDFs)")
+    extract_tables = st.checkbox("📊 Extract Tables")
+
+    # Build config
+    config = {
+        **DEFAULT_CONFIG,
+        "llm_model": llm_model,
+        "embedding_model": embedding_model,
+        "chunking_method": chunking_method,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "use_hierarchical_retrieval": use_hierarchical_retrieval,
+        "proposition_extraction": proposition_extraction,
+        "multimodal_enabled": multimodal_enabled,
+        "retrieval_k": retrieval_k,
+        "search_type": search_type,
+        "similarity_threshold": similarity_threshold,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "ocr_enabled": ocr_enabled,
+        "extract_tables": extract_tables,
+        "use_reranking": use_reranking,
+        "use_query_expansion": use_query_expansion,
+        "storage_path": storage_path,
+    }
+
+    if st.button("🔄 Reset Session"):
+        for key in st.session_state.keys():
+            st.session_state[key] = [] if key == "chat_history" else None
+        st.rerun()
+
+# ======================
+# MAIN LAYOUT
+# ======================
+col1, col2 = st.columns([1, 2])
+
+# LEFT: PDF Upload
+with col1:
+    st.subheader("📁 Load PDFs")
+    pdf_folder = st.text_input("📁 PDF Folder (optional)")
+    uploaded_files = st.file_uploader("📤 Upload PDFs", type="pdf", accept_multiple_files=True)
+
+    if st.button("🚀 Load & Index", use_container_width=True):
+        pdf_paths: List[str] = []
+
+        # From folder
+        if pdf_folder and os.path.isdir(pdf_folder):
+            pdf_paths.extend([str(p) for p in Path(pdf_folder).glob("*.pdf")])
+
+        # From uploads
+        if uploaded_files:
+            temp_dir = tempfile.mkdtemp()
+            for uf in uploaded_files:
+                path = os.path.join(temp_dir, uf.name)
+                with open(path, "wb") as f:
+                    f.write(uf.getbuffer())
+                pdf_paths.append(path)
+
+        if not pdf_paths:
+            st.error("❌ No PDFs provided!")
+        else:
+            with st.spinner("⏳ Processing..."):
+                try:
+                    chunks = docling_chunks_from_pdfs(config, pdf_paths)
+                    if not chunks:
+                        st.error("❌ No text extracted. Try enabling OCR for scanned PDFs.")
+                    else:
+                        chain, _, base_retriever, vectorstore, llm = setup_rag_chain(config, chunks)
+                        st.session_state.update({
+                            "rag_chain": chain,
+                            "base_retriever": base_retriever,
+                            "vectorstore": vectorstore,
+                            "llm": llm,
+                            "documents_loaded": True
+                        })
+                        st.success(f"✅ Loaded {len(pdf_paths)} PDFs ({len(chunks)} chunks)!")
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
+                    logger.exception("Load error")
+
+    if st.session_state.documents_loaded:
+        count = st.session_state.vectorstore._collection.count()
+        st.info(f"✅ Ready! {count} chunks indexed.")
+
+# RIGHT: Chat
+with col2:
+    st.subheader("💬 Ask Questions")
+    if st.session_state.documents_loaded and st.session_state.rag_chain:
+        # Chat history
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+                if "sources" in msg:
+                    with st.expander("📚 Sources"):
+                        for i, src in enumerate(msg["sources"], 1):
+                            st.markdown(f"**Source {i}:** `{src['metadata'].get('filename', 'Unknown')} ({src['metadata'].get('chunk_type', 'unknown')})`")
+                            st.text(src["content"][:300] + ("..." if len(src["content"]) > 300 else ""))
+
+        # User input
+        if prompt := st.chat_input("Ask about your PDFs..."):
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+
+            # Query expansion
+            query = expand_query(prompt, st.session_state.llm) if config["use_query_expansion"] else prompt
+
+            with st.spinner("🤔 Thinking..."):
+                try:
+                    answer = st.session_state.rag_chain.invoke(prompt)
+                    sources = [
+                        {"content": doc.page_content, "metadata": doc.metadata}
+                        for doc in st.session_state.base_retriever.get_relevant_documents(prompt)
+                    ]
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": sources
+                    })
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Response error: {e}")
+                    logger.exception("Chat error")
+
+        if st.button("🗑️ Clear Chat"):
+            st.session_state.chat_history = []
+            st.rerun()
+    else:
+        st.info("👈 Load PDFs to start chatting!")
+        st.markdown("""
+        ### 🚀 Quick Start
+        1. Make sure **Ollama is running**
+        2. Upload PDFs or enter a folder path
+        3. Click **Load & Index**
+        4. Ask questions!
+        """)
+-------------------------------------------
+"""
+🎯 Configuration defaults and validation.
+Designed so even a beginner can tweak settings safely.
+"""
+
+from typing import Dict, Any
+
+# Default configuration with tooltips as comments
+DEFAULT_CONFIG: Dict[str, Any] = {
+    # 🤖 LLM Settings
+    "llm_model": "gemma2:2b",          # Ollama model for answers (must be installed)
+    "temperature": 0.7,                # Creativity: 0.0 (focused) → 1.0 (creative)
+    "max_tokens": 512,                 # Max length of AI response
+
+    # 🔗 Embedding Settings
+    "embedding_model": "nomic-embed-text:latest",  # Embedding model (must be in Ollama)
+
+    # ✂️ Chunking Settings
+    "chunking_method": "docling",      # Options: "docling" (hierarchical/hybrid), "recursive", "semantic", "llm_powered", "hybrid"
+    "chunk_size": 800,                 # Tokens per chunk (~600 words)
+    "chunk_overlap": 100,              # Overlap to preserve context between chunks
+    "use_hierarchical_retrieval": False,  # Use parent-child retrieval for hierarchical chunks
+    "proposition_extraction": False,   # Use LLM to extract standalone propositions
+    "multimodal_enabled": False,       # Extract images/tables for hybrid chunking
+
+    # 🔍 Retrieval Settings
+    "retrieval_k": 5,                  # Number of document chunks to retrieve
+    "search_type": "mmr",              # "mmr" (diverse), "similarity", or "similarity_score_threshold"
+    "similarity_threshold": 0.3,       # Only used if search_type = "similarity_score_threshold"
+
+    # ⚙️ Advanced Features
+    "use_reranking": False,            # Rerank results with LLM (slower, more accurate)
+    "use_query_expansion": False,      # Expand query with synonyms (better recall)
+
+    # 📄 Document Processing
+    "ocr_enabled": False,              # Extract text from scanned PDFs (requires Docling models)
+    "extract_tables": False,           # Parse tables as structured data
+
+    # 💾 Storage
+    "storage_path": None,              # e.g., "./chromadb_storage" — leave None for temporary
+}
+
+-------------
+"""
+📄 PDF Processing with Docling and enhanced chunking.
+Handles OCR, tables, and multiple chunking strategies for better LLM retrieval/summarization.
+Compatible with Docling v0.1.x and v0.2.x+.
+"""
+
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Any
+import streamlit as st
+from docling.document_converter import DocumentConverter
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.base_models import InputFormat
+from docling.chunking import HybridChunker, HierarchicalChunker
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_community.chat_models import ChatOllama
+from unstructured.partition.pdf import partition_pdf
+import json
+from utils import sanitize_metadata, logger
+
+def docling_chunks_from_pdfs(config: Dict[str, Any], pdf_paths: List[str]) -> List[Dict[str, Any]]:
+    """
+    Convert PDFs to text chunks using Docling or other strategies.
+    Returns list of {"content": "...", "metadata": {...}}.
+    """
+    st.write("📋 Initializing PDF converter...")
+
+    # Configure Docling pipeline
+    try:
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = config["ocr_enabled"]
+        pipeline_options.do_table_structure = config["extract_tables"]
+        doc_converter = DocumentConverter(
+            allowed_formats=[InputFormat.PDF],
+            pipeline_options=pipeline_options
+        )
+    except TypeError:
+        st.write("  ⚠️ Using legacy Docling API (older version)")
+        doc_converter = DocumentConverter(allowed_formats=[InputFormat.PDF])
+
+    all_chunks = []
+    total_pdfs = len(pdf_paths)
+
+    for idx, pdf_path in enumerate(pdf_paths, 1):
+        try:
+            filename = Path(pdf_path).name
+            st.write(f"📄 Processing {idx}/{total_pdfs}: {filename}...")
+
+            # Convert PDF with Docling for default/hierarchical
+            result = doc_converter.convert(pdf_path)
+            doc = result.document
+            markdown_text = doc.export_to_markdown()
+
+            # Dispatch chunking based on config
+            if config["chunking_method"] == "recursive":
+                chunks = recursive_chunking(markdown_text, config)
+            elif config["chunking_method"] == "semantic":
+                chunks = semantic_chunking(markdown_text, config)
+            elif config["chunking_method"] == "llm_powered":
+                chunks = llm_powered_chunking(doc, config, st.session_state.get("llm"))
+            elif config["chunking_method"] == "hybrid":
+                chunks = hybrid_multimodal_chunking(pdf_path, config)
+            else:  # Default: docling (hierarchical/hybrid)
+                chunker_class = HierarchicalChunker if config["chunking_method"] == "hierarchical" else HybridChunker
+                chunker = chunker_class(
+                    max_tokens=config["chunk_size"],
+                    overlap=config["chunk_overlap"]
+                )
+                chunk_iter = chunker.chunk(doc)
+                chunks = []
+                for chunk in chunk_iter:
+                    chunk_text = getattr(chunk, 'text', getattr(chunk, 'content', ''))
+                    if not (chunk_text and chunk_text.strip()):
+                        continue
+                    metadata = {
+                        "source": str(pdf_path),
+                        "filename": filename,
+                        "page": getattr(chunk, "page_num", None),
+                        "chunk_type": config["chunking_method"]
+                    }
+                    if hasattr(chunk, 'meta') and chunk.meta:
+                        try:
+                            meta_dict = chunk.meta.to_dict() if hasattr(chunk.meta, 'to_dict') else dict(chunk.meta)
+                            if isinstance(meta_dict, dict):
+                                metadata.update(meta_dict)
+                        except Exception as e:
+                            logger.warning(f"Metadata extraction issue: {e}")
+                    chunks.append({"content": chunk_text, "metadata": metadata})
+
+            # Process chunks
+            for chunk in chunks:
+                metadata = sanitize_metadata({
+                    **chunk.get("metadata", {}),
+                    "source": str(pdf_path),
+                    "filename": filename,
+                    "chunk_type": config["chunking_method"]
+                })
+                all_chunks.append({"content": chunk["content"], "metadata": metadata})
+
+            st.write(f"  └─ ✓ Extracted {len(chunks)} {config['chunking_method']} chunks")
+
+        except Exception as e:
+            st.warning(f"⚠️ Failed to process {Path(pdf_path).name}: {e}")
+            logger.exception(f"PDF processing error: {e}")
+
+    return all_chunks
+
+def recursive_chunking(text: str, config: Dict) -> List[Dict]:
+    """Split text into fixed-size chunks with natural boundaries."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=config["chunk_size"],
+        chunk_overlap=config["chunk_overlap"],
+        separators=["\n\n", "\n", " ", ""],  # Paragraphs → sentences → words
+        length_function=len
+    )
+    splits = splitter.split_text(text)
+    return [{"content": s, "metadata": {}} for s in splits]
+
+def semantic_chunking(text: str, config: Dict) -> List[Dict]:
+    """Split text semantically using embeddings."""
+    embeddings = OllamaEmbeddings(model=config["embedding_model"])
+    splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
+    splits = splitter.split_text(text)
+    return [{"content": s, "metadata": {"chunk_type": "semantic"}} for s in splits]
+
+def llm_powered_chunking(doc, config: Dict, llm) -> List[Dict]:
+    """Use LLM to extract propositions (standalone factual statements)."""
+    if not llm:
+        st.warning("⚠️ LLM not initialized for proposition chunking; falling back to recursive")
+        return recursive_chunking(doc.export_to_markdown(), config)
+
+    markdown_text = doc.export_to_markdown()
+    # Split into manageable sections first to avoid overwhelming LLM
+    pre_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+    sections = pre_splitter.split_text(markdown_text)
+    
+    chunks = []
+    for section in sections:
+        prompt = f"""
+        Break the following text into concise, standalone factual statements (propositions).
+        Each should be self-contained and no longer than {config['chunk_size']} characters.
+        Return as a numbered list:
+        
+        Text: {section}
+        
+        Propositions:
+        """
+        try:
+            response = llm.invoke(prompt)
+            propositions = response.content if hasattr(response, 'content') else str(response)
+            # Parse numbered list (e.g., "1. Fact one\n2. Fact two")
+            for line in propositions.split('\n'):
+                if line.strip() and line[0].isdigit() and '.' in line:
+                    prop = line[line.find('.')+1:].strip()
+                    if prop:
+                        chunks.append({"content": prop, "metadata": {"chunk_type": "proposition"}})
+        except Exception as e:
+            logger.warning(f"LLM chunking failed: {e}; falling back to recursive for section")
+            chunks.extend(recursive_chunking(section, config))
+    
+    return chunks if chunks else recursive_chunking(markdown_text, config)
+
+def hybrid_multimodal_chunking(pdf_path: str, config: Dict) -> List[Dict]:
+    """Extract text, tables, and images using Unstructured.io."""
+    if config["multimodal_enabled"]:
+        try:
+            elements = partition_pdf(pdf_path, strategy="hi_res")  # Extracts text, tables, images
+            chunks = []
+            for elem in elements:
+                if elem.category == "Table":
+                    content = json.dumps(elem.metadata.text_as_html)  # Structured table
+                elif elem.category == "Image":
+                    content = f"[Image placeholder: {elem.metadata.image_path}]"  # Placeholder (add VLM later)
+                else:
+                    content = elem.text
+                if content and content.strip():
+                    chunks.append({"content": content, "metadata": {"category": elem.category}})
+            return chunks
+        except Exception as e:
+            st.warning(f"⚠️ Hybrid chunking failed: {e}; falling back to recursive")
+    return recursive_chunking(Path(pdf_path).read_text(), config)
+-------------------------------
+"""
+🧠 RAG Engine: Vectorstore, retriever, and LLM chain.
+Handles embeddings, retrieval, and answer generation with hierarchical support.
+"""
+
+import uuid
+import tempfile
+import os
+from typing import Tuple, Any, Dict, List, Optional
+from pathlib import Path
+
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.chat_models import ChatOllama
+from langchain_chroma import Chroma
+from langchain.prompts import PromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+from langchain.retrievers import ContextualCompressionRetriever, ParentDocumentRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.storage import InMemoryStore
+from langchain_core.documents import Document
+
+from config import DEFAULT_CONFIG
+from utils import sanitize_metadata, logger
+
+
+def expand_query(query: str, llm: ChatOllama) -> str:
+    """Expand query with synonyms or related terms for better recall."""
+    if not query.strip():
+        return query
+    prompt = f'Given the query: "{query}", generate 2-3 related search queries (comma-separated only):'
+    try:
+        response = llm.invoke(prompt)
+        expanded = getattr(response, "content", str(response)).strip()
+        return f"{query} {expanded}"
+    except Exception as e:
+        logger.warning(f"Query expansion failed: {e}")
+        return query
+
+
+def hyde_query(query: str, llm: ChatOllama) -> str:
+    """Generate a hypothetical document to improve embedding alignment."""
+    prompt = f"Write a concise paragraph that directly answers the following question: '{query}'"
+    try:
+        response = llm.invoke(prompt)
+        return getattr(response, "content", "").strip()
+    except Exception as e:
+        logger.warning(f"Hypothetical document generation failed: {e}")
+        return query
+
+
+def create_embeddings(model_name: str) -> OllamaEmbeddings:
+    """Initialize embeddings model."""
+    return OllamaEmbeddings(model=model_name, show_progress=True)
+
+
+def build_vectorstore(
+    texts: List[str],
+    metadatas: List[Dict[str, Any]],
+    embeddings: OllamaEmbeddings,
+    persist_directory: Optional[str] = None,
+) -> Chroma:
+    """Create or load a Chroma vectorstore."""
+    collection_name = f"rag_{uuid.uuid4().hex[:8]}"
+    if persist_directory:
+        Path(persist_directory).mkdir(parents=True, exist_ok=True)
+
+    return Chroma.from_texts(
+        texts=texts,
+        embedding=embeddings,
+        metadatas=metadatas,
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        collection_metadata={"hnsw:space": "cosine"},
+    )
+
+
+def build_retriever(
+    vectorstore: Chroma,
+    documents: List[Document],
+    config: Dict[str, Any],
+    llm: Optional[ChatOllama] = None,
+) -> Tuple[Any, Any]:
+    """
+    Build base and optional reranked retrievers.
+    Returns: (base_retriever, retriever_for_chain)
+    """
+    base_retriever = None
+
+    # Prepare search kwargs
+    search_kwargs = {"k": config["retrieval_k"]}
+    if config["search_type"] == "similarity_score_threshold":
+        search_kwargs["score_threshold"] = config["similarity_threshold"]
+    elif config["search_type"] == "mmr":
+        search_kwargs.update({"fetch_k": config["retrieval_k"] * 3, "lambda_mult": 0.5})
+
+    if config["use_hierarchical_retrieval"]:
+        try:
+            docstore = InMemoryStore()
+            parent_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=2000, chunk_overlap=200
+            )
+            child_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=400, chunk_overlap=50
+            )
+            retriever = ParentDocumentRetriever(
+                vectorstore=vectorstore,
+                docstore=docstore,
+                child_splitter=child_splitter,
+                parent_splitter=parent_splitter,
+            )
+            retriever.add_documents(documents)  # Critical: ingest parent-child structure
+            base_retriever = retriever
+            logger.info("Hierarchical retriever initialized successfully.")
+        except Exception as e:
+            logger.warning(f"Hierarchical retrieval setup failed: {e}. Falling back to standard.")
+            base_retriever = vectorstore.as_retriever(
+                search_type=config["search_type"] if config["search_type"] != "mmr" else "mmr",
+                search_kwargs=search_kwargs,
+            )
+    else:
+        base_retriever = vectorstore.as_retriever(
+            search_type=config["search_type"] if config["search_type"] != "mmr" else "mmr",
+            search_kwargs=search_kwargs,
+        )
+
+    # Apply reranking if enabled
+    retriever_for_chain = base_retriever
+    if config["use_reranking"] and llm is not None:
+        try:
+            compressor = LLMChainExtractor.from_llm(llm)
+            retriever_for_chain = ContextualCompressionRetriever(
+                base_compressor=compressor,
+                base_retriever=base_retriever,
+            )
+            logger.info("Reranking enabled via LLMChainExtractor.")
+        except Exception as e:
+            logger.warning(f"Reranking failed (using base retriever): {e}")
+
+    return base_retriever, retriever_for_chain
+
+
+def build_llm(config: Dict[str, Any]) -> ChatOllama:
+    """Initialize the LLM."""
+    return ChatOllama(
+        model=config["llm_model"],
+        temperature=config["temperature"],
+        num_predict=config["max_tokens"],
+    )
+
+
+def build_rag_chain(
+    retriever_for_chain: Any,
+    llm: ChatOllama,
+    config: Dict[str, Any],
+) -> Any:
+    """Construct the final RAG chain."""
+    chunk_types = "e.g., propositions, tables" if (
+        config["proposition_extraction"] or config["multimodal_enabled"]
+    ) else "text"
+
+    prompt = PromptTemplate.from_template(
+        """You are a helpful assistant. Use the context (noting chunk types: {chunk_types}) to answer the question. 
+If unsure, say "I don't know". Keep answers concise.
+
+Context: {context}
+Question: {question}
+Answer:""",
+        partial_variables={"chunk_types": chunk_types}
+    )
+
+    return (
+        {"context": retriever_for_chain, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+
+def setup_rag_chain(
+    config: Dict[str, Any],
+    chunks: List[Dict[str, Any]],
+) -> Tuple[Any, Any, Any, Chroma, ChatOllama]:
+    """
+    Build full RAG system from config and chunks.
+    Returns: (chain, retriever_for_chain, base_retriever, vectorstore, llm)
+    """
+    # Validate input
+    valid_chunks = [c for c in chunks if c.get("content", "").strip()]
+    if not valid_chunks:
+        raise ValueError("No valid text chunks found in input!")
+
+    # Sanitize metadata
+    for c in valid_chunks:
+        c["metadata"] = sanitize_metadata(c.get("metadata", {}))
+
+    # Initialize LLM early (needed for query expansion & reranking)
+    llm = build_llm(config)
+
+    # Optionally expand query (note: not used in chain directly—caller should handle)
+    # This function is provided for external use; chain uses raw question
+
+    # Prepare documents
+    documents = [
+        Document(
+            page_content=c["content"],
+            metadata=c["metadata"],
+        )
+        for c in valid_chunks
+    ]
+
+    # Embeddings & Vectorstore
+    embeddings = create_embeddings(config["embedding_model"])
+    persist_dir = config.get("storage_path") or tempfile.mkdtemp()
+    texts = [c["content"] for c in valid_chunks]
+    metadatas = [c["metadata"] for c in valid_chunks]
+    vectorstore = build_vectorstore(texts, metadatas, embeddings, persist_dir)
+
+    # Retriever(s)
+    base_retriever, retriever_for_chain = build_retriever(
+        vectorstore, documents, config, llm
+    )
+
+    # Final chain
+    chain = build_rag_chain(retriever_for_chain, llm, config)
+
+    return chain, retriever_for_chain, base_retriever, vectorstore, llm
+    -------
+    """
+🛠️ Utility functions: logging, metadata sanitization, Ollama checks.
+Safe, reusable, and beginner-proof.
+"""
+
+import logging
+import os
+from typing import Dict, Any, Optional
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def sanitize_metadata(md: Optional[Dict[Any, Any]], max_str_len: int = 10000) -> Dict[str, Any]:
+    """
+    Ensure metadata is JSON-serializable and not too large.
+    Prevents ChromaDB crashes from weird PDF metadata.
+    """
+    if not md:
+        return {}
+    
+    def to_jsonable(v):
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            return v
+        try:
+            s = str(v)
+            return s if len(s) <= max_str_len else s[:max_str_len] + "..."
+        except Exception:
+            return None
+
+    out = {}
+    for k, v in md.items():
+        try:
+            out[str(k)] = to_jsonable(v)
+        except Exception:
+            out[str(k)] = None
+    return out
+
+def check_ollama_connection(embedding_model: str = "nomic-embed-text:latest") -> bool:
+    """
+    Test if Ollama is running and the embedding model is available.
+    Returns True if working, False otherwise.
+    """
+    try:
+        from langchain_community.embeddings import OllamaEmbeddings
+        embeddings = OllamaEmbeddings(model=embedding_model)
+        embeddings.embed_query("test")
+        logger.info("✅ Ollama connection successful")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ollama connection failed: {e}")
+        return False
