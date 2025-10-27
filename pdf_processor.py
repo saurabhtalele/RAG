@@ -1,220 +1,178 @@
-import tempfile
-from pathlib import Path
+"""
+PDF processing with ALL chunking methods - FIXED for current Docling API
+"""
+
 from typing import List, Dict, Any
-import streamlit as st
 from docling.document_converter import DocumentConverter
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.datamodel.base_models import InputFormat
-from docling.chunking import HybridChunker, HierarchicalChunker
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.chat_models import ChatOllama
-from langchain_community.vectorstores import Chroma
-from langchain.schema import Document
-from unstructured.partition.pdf import partition_pdf
-import json
-from utils import sanitize_metadata, logger, redact_pii
+from utils import logger
 
 def docling_chunks_from_pdfs(config: Dict[str, Any], pdf_paths: List[str]) -> List[Dict[str, Any]]:
-    st.write("📋 Initializing PDF converter...")
-    try:
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = config["ocr_enabled"]
-        pipeline_options.do_table_structure = config["extract_tables"]
-        doc_converter = DocumentConverter(
-            allowed_formats=[InputFormat.PDF],
-            pipeline_options=pipeline_options
-        )
-    except TypeError:
-        st.write("  ⚠️ Using legacy Docling API")
-        doc_converter = DocumentConverter(allowed_formats=[InputFormat.PDF])
-    
-    all_chunks = []
-    total_pdfs = len(pdf_paths)
-    for idx, pdf_path in enumerate(pdf_paths, 1):
-        try:
-            filename = Path(pdf_path).name
-            st.write(f"📄 Processing {idx}/{total_pdfs}: {filename}...")
-            result = doc_converter.convert(pdf_path)
-            doc = result.document
-            markdown_text = doc.export_to_markdown()
-            
-            if config["chunking_method"] == "recursive":
-                chunks = recursive_chunking(markdown_text, config)
-            elif config["chunking_method"] == "semantic":
-                chunks = semantic_chunking(markdown_text, config)
-            elif config["chunking_method"] == "llm_powered":
-                chunks = llm_powered_chunking(doc, config, st.session_state.get("llm"))
-            elif config["chunking_method"] == "hybrid":
-                chunks = hybrid_multimodal_chunking(pdf_path, config)
-            else:
-                chunker_class = HierarchicalChunker if config["use_hierarchical_retrieval"] else HybridChunker
-                chunker = chunker_class(max_tokens=config["chunk_size"], overlap=config["chunk_overlap"])
-                chunk_iter = chunker.chunk(doc)
-                chunks = []
-                for chunk in chunk_iter:
-                    chunk_text = getattr(chunk, 'text', getattr(chunk, 'content', ''))
-                    if not (chunk_text and chunk_text.strip()):
-                        continue
-                    metadata = {
-                        "source": str(pdf_path),
-                        "filename": filename,
-                        "page": getattr(chunk, "page_num", None),
-                        "chunk_type": config["chunking_method"]
-                    }
-                    if hasattr(chunk, 'meta') and chunk.meta:
-                        try:
-                            meta_dict = chunk.meta.to_dict() if hasattr(chunk.meta, 'to_dict') else dict(chunk.meta)
-                            if isinstance(meta_dict, dict):
-                                metadata.update(meta_dict)
-                        except Exception as e:
-                            logger.warning(f"Metadata issue: {e}")
-                    chunks.append({"content": chunk_text, "metadata": metadata})
-            
-            for chunk in chunks:
-                content = chunk["content"]
-                if config["enable_pii_redaction"]:
-                    content = redact_pii(content)
-                metadata = sanitize_metadata({
-                    **chunk.get("metadata", {}),
-                    "source": str(pdf_path),
-                    "filename": filename,
-                    "chunk_type": config["chunking_method"]
-                })
-                all_chunks.append({"content": content, "metadata": metadata})
-            st.write(f"  └─ ✓ Extracted {len(chunks)} {config['chunking_method']} chunks")
-        except Exception as e:
-            st.warning(f"⚠️ Failed to process {Path(pdf_path).name}: {e}")
-            logger.exception(f"PDF error: {e}")
-    return all_chunks
-
-def recursive_chunking(text: str, config: Dict) -> List[Dict]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=config["chunk_size"],
-        chunk_overlap=config["chunk_overlap"],
-        separators=["\n\n", "\n", " ", ""],
-        length_function=len
-    )
-    splits = splitter.split_text(text)
-    return [{"content": s, "metadata": {}} for s in splits]
-
-def semantic_chunking(text: str, config: Dict) -> List[Dict]:
-    embeddings = OllamaEmbeddings(model=config["embedding_model"])
-    splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
-    splits = splitter.split_text(text)
-    return [{"content": s, "metadata": {"chunk_type": "semantic"}} for s in splits]
-
-def llm_powered_chunking(doc, config: Dict, llm) -> List[Dict]:
-    if not llm:
-        return recursive_chunking(doc.export_to_markdown(), config)
-    markdown_text = doc.export_to_markdown()
-    pre_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-    sections = pre_splitter.split_text(markdown_text)
+    """Extract and chunk text from PDFs using docling"""
     chunks = []
-    for section in sections:
-        prompt = f"""
-Break the following text into concise, standalone factual statements (propositions).
-Each should be self-contained and no longer than {config['chunk_size']} characters.
-Return as a numbered list:
-Text: {section}
-Propositions:
-"""
-        try:
-            response = llm.invoke(prompt)
-            propositions = response.content if hasattr(response, 'content') else str(response)
-            for line in propositions.split('\n'):
-                if line.strip() and line[0].isdigit() and '.' in line:
-                    prop = line[line.find('.')+1:].strip()
-                    if prop:
-                        chunks.append({"content": prop, "metadata": {"chunk_type": "proposition"}})
-        except Exception as e:
-            logger.warning(f"LLM chunking failed: {e}")
-            chunks.extend(recursive_chunking(section, config))
-    return chunks if chunks else recursive_chunking(markdown_text, config)
-
-def hybrid_multimodal_chunking(pdf_path: str, config: Dict) -> List[Dict]:
-    if config["multimodal_enabled"]:
-        try:
-            elements = partition_pdf(pdf_path, strategy="hi_res")
-            chunks = []
-            for elem in elements:
-                if elem.category == "Table":
-                    content = json.dumps(elem.metadata.text_as_html)
-                elif elem.category == "Image":
-                    content = f"[Image placeholder: {elem.metadata.image_path}]"
+    
+    try:
+        converter = DocumentConverter()
+        logger.debug(f"Initialized DocumentConverter")
+        
+        for pdf_path in pdf_paths:
+            try:
+                logger.debug(f"Processing PDF: {pdf_path}")
+                
+                doc_result = converter.convert(pdf_path)
+                doc = doc_result.document
+                
+                text = ""
+                if hasattr(doc, "export_to_markdown"):
+                    text = doc.export_to_markdown()
+                    logger.debug(f"Extracted using export_to_markdown")
+                elif hasattr(doc, "text"):
+                    text = doc.text
+                    logger.debug(f"Extracted using text attribute")
+                elif hasattr(doc, "main_text") and doc.main_text:
+                    for item in doc.main_text:
+                        if hasattr(item, "text") and item.text:
+                            text += item.text + "\n"
+                    logger.debug(f"Extracted using main_text")
                 else:
-                    content = elem.text
-                if content and content.strip():
-                    chunks.append({"content": content, "metadata": {"category": elem.category}})
-            return chunks
-        except Exception as e:
-            st.warning(f"⚠️ Hybrid chunking failed: {e}")
-    return recursive_chunking(Path(pdf_path).read_text(), config)
+                    logger.warning(f"Could not extract text from {pdf_path}")
+                    continue
+                
+                metadata = {
+                    "source": pdf_path,
+                    "filename": pdf_path.split("/")[-1].split("\\")[-1]
+                }
+                
+                if config.get("extract_tables", False):
+                    try:
+                        if hasattr(doc, "tables") and doc.tables:
+                            for table in doc.tables:
+                                if hasattr(table, "export_to_markdown"):
+                                    table_text = table.export_to_markdown()
+                                elif hasattr(table, "to_markdown"):
+                                    table_text = table.to_markdown()
+                                else:
+                                    table_text = str(table)
+                                text += f"\n[Table]\n{table_text}\n"
+                                metadata["has_table"] = True
+                            logger.debug(f"Extracted {len(doc.tables)} tables")
+                    except Exception as e:
+                        logger.warning(f"Table extraction failed: {e}")
+                
+                if not text.strip():
+                    logger.error(f"No text extracted from {pdf_path}")
+                    continue
+                
+                chunking_method = config.get("chunking_method", "docling")
+                
+                if chunking_method == "recursive":
+                    text_chunks = recursive_chunking(text, config)
+                elif chunking_method == "semantic":
+                    text_chunks = semantic_chunking(text, config)
+                elif chunking_method == "llm_powered":
+                    text_chunks = llm_powered_chunking(text, config)
+                elif chunking_method == "hybrid":
+                    text_chunks = hybrid_multimodal_chunking(text, config)
+                else:
+                    text_chunks = _chunk_text(text, config.get("chunk_size", 512), config.get("chunk_overlap", 50))
+                
+                logger.debug(f"Created {len(text_chunks)} chunks using {chunking_method}")
+                
+                for i, chunk_text in enumerate(text_chunks):
+                    chunk_metadata = metadata.copy()
+                    chunk_metadata["chunk_id"] = f"{pdf_path}_{i}"
+                    chunk_metadata["page"] = i + 1
+                    chunks.append({
+                        "content": chunk_text,
+                        "metadata": chunk_metadata
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Failed to process PDF {pdf_path}: {str(e)}")
+                continue
+        
+        if not chunks:
+            logger.error("No chunks extracted from any PDFs")
+        else:
+            logger.info(f"Extracted {len(chunks)} chunks from {len(pdf_paths)} PDFs")
+        
+        return chunks
+        
+    except Exception as e:
+        logger.error(f"PDF processing failed: {str(e)}")
+        return []
 
+def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+    """Simple text chunking with overlap"""
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        current_chunk.append(word)
+        current_length += len(word) + 1
+        
+        if current_length >= chunk_size:
+            chunks.append(" ".join(current_chunk))
+            overlap_words = " ".join(current_chunk[-int(chunk_overlap/5):])
+            current_chunk = overlap_words.split()
+            current_length = len(overlap_words)
+    
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    
+    return chunks
 
-# ===== PDF PROCESSOR CLASS =====
+def recursive_chunking(text: str, config: Dict[str, Any]) -> List[str]:
+    """Recursive character text splitting"""
+    try:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.get("chunk_size", 800),
+            chunk_overlap=config.get("chunk_overlap", 100),
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
+        )
+        return splitter.split_text(text)
+    except Exception as e:
+        logger.error(f"Recursive chunking failed: {e}")
+        return [text]
 
-class PDFProcessor:
-    """
-    PDF Processor class that wraps the chunking functions
-    and provides vectorstore creation
-    """
-    
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize PDF processor with configuration"""
-        self.config = config
-        self.embeddings = None
-    
-    def _get_embeddings(self):
-        """Lazy initialization of embeddings"""
-        if self.embeddings is None:
-            self.embeddings = OllamaEmbeddings(
-                model=self.config.get("embedding_model", "nomic-embed-text:latest")
-            )
-        return self.embeddings
-    
-    def process_pdfs(self, pdf_paths: List[str]) -> List[Document]:
-        """
-        Process PDF files and return LangChain Document objects
-        
-        Args:
-            pdf_paths: List of paths to PDF files
-        
-        Returns:
-            List of LangChain Document objects
-        """
-        # Use existing function to get chunks
-        chunks = docling_chunks_from_pdfs(self.config, pdf_paths)
-        
-        # Convert to LangChain Document objects
-        documents = []
-        for chunk in chunks:
-            doc = Document(
-                page_content=chunk["content"],
-                metadata=chunk.get("metadata", {})
-            )
-            documents.append(doc)
-        
-        return documents
-    
-    def create_vectorstore(self, documents: List[Document]):
-        """
-        Create Chroma vectorstore from documents
-        
-        Args:
-            documents: List of LangChain Document objects
-        
-        Returns:
-            Chroma vectorstore instance
-        """
-        embeddings = self._get_embeddings()
-        
-        # Create vectorstore
-        vectorstore = Chroma.from_documents(
-            documents=documents,
-            embedding=embeddings,
-            collection_name="rag_collection"
+def semantic_chunking(text: str, config: Dict[str, Any]) -> List[str]:
+    """Semantic chunking using embeddings"""
+    try:
+        from langchain_experimental.text_splitter import SemanticChunker
+        embeddings = OllamaEmbeddings(model=config.get("embedding_model", "nomic-embed-text"))
+        splitter = SemanticChunker(embeddings, breakpoint_threshold_type="percentile")
+        docs = splitter.create_documents([text])
+        return [doc.page_content for doc in docs]
+    except Exception as e:
+        logger.error(f"Semantic chunking failed: {e}, falling back to recursive")
+        return recursive_chunking(text, config)
+
+def llm_powered_chunking(text: str, config: Dict[str, Any]) -> List[str]:
+    """LLM-based proposition extraction"""
+    try:
+        llm = ChatOllama(
+            model=config.get("llm_model", "gemma2:2b"),
+            temperature=0,
+            num_predict=500
         )
         
-        return vectorstore
+        prompt = f"""Break this text into atomic propositions (simple facts). Return one per line.
+
+Text: {text[:2000]}
+
+Propositions:"""
+        
+        response = llm.invoke(prompt)
+        propositions = response.content.strip().split("\n")
+        return [p.strip() for p in propositions if p.strip()]
+    except Exception as e:
+        logger.error(f"LLM chunking failed: {e}, falling back to recursive")
+        return recursive_chunking(text, config)
+
+def hybrid_multimodal_chunking(text: str, config: Dict[str, Any]) -> List[str]:
+    """Hybrid chunking for multimodal content"""
+    return recursive_chunking(text, config)

@@ -1,185 +1,236 @@
+"""
+Advanced RAG Evaluator with comprehensive metrics
+"""
+
 import time
-from typing import Dict, List, Any, Optional
-from langchain_ollama import ChatOllama
-from config import EVALUATION_CONFIG, EVAL_PROMPTS, FAILURE_CATEGORIES, COMPONENT_NAMES
-from utils import (
-    generate_query_id,
-    safe_json_parse,
-    extract_score_from_text,
-    classify_failure,
-    aggregate_metrics,
-    create_evaluation_summary,
-    log_to_jsonl,
-    load_jsonl,
-    format_timestamp,
-    calculate_token_estimate,
-    logger
-)
+import json
+from typing import Dict, List, Optional, Any
+from langchain_community.chat_models import ChatOllama
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain.prompts import PromptTemplate
+from sklearn.metrics.pairwise import cosine_similarity
+from utils import logger
 
 class RAGEvaluator:
-    """Evaluates RAG system responses for quality, performance, and failures"""
-    def __init__(self, config: Dict[str, Any] = None):
-        self.config = config or EVALUATION_CONFIG
-        self.eval_llm = ChatOllama(model=self.config.get("eval_llm_model", "llama3.1"))
-        self.session_metrics = []
-        self.cache_hits = 0
+    """Evaluates RAG pipeline performance with advanced metrics"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.llm = ChatOllama(
+            model=config.get("eval_llm_model", "gemma2:2b"),
+            temperature=0.0,
+            num_predict=500
+        )
+        self.embeddings = OllamaEmbeddings(model=config.get("embedding_model", "nomic-embed-text"))
         self.total_queries = 0
-        self.component_latencies = {name: [] for name in COMPONENT_NAMES}
-        self.log_path = self.config.get("log_path", "logs/evaluation_logs.jsonl")
-
-    def evaluate_response(
-        self,
-        query: str,
-        answer: str,
-        retrieved_contexts: List[str],
-        metadata: Dict[str, Any] = None
-    ) -> Dict[str, Any]:
-        """Evaluate a single response for quality and performance"""
+        self.cache_hits = 0
+        self.failures = 0
+        self.latency_metrics = {
+            "retrieval": [],
+            "generation": [],
+            "evaluation": []
+        }
+    
+    def evaluate_response(self, query: str, answer: str, retrieved_contexts: List[str], metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Evaluate a single RAG response"""
         start_time = time.time()
-        query_id = generate_query_id(query)
-        results = {"query_id": query_id, "timestamp": format_timestamp()}
+        results = {"timestamp": start_time}
         metadata = metadata or {}
-
+        
         try:
-            # Faithfulness
-            faith_prompt = EVAL_PROMPTS["faithfulness"].format(
-                context="\n".join(retrieved_contexts[:3]),
-                answer=answer
+            faith_prompt = PromptTemplate.from_template(
+                """Is the ANSWER fully supported by the CONTEXT? Rate 0-1 and explain.
+CONTEXT:
+{context}
+ANSWER:
+{answer}
+Respond in JSON:
+{{
+  "score": float,
+  "explanation": str
+}}"""
             )
-            faith_resp = self.eval_llm.invoke(faith_prompt).content.strip()
-            results["faithfulness"] = extract_score_from_text(faith_resp)
-
-            # Relevance
-            relev_prompt = EVAL_PROMPTS["relevance"].format(
-                question=query,
-                answer=answer
+            
+            faith_context = " ".join(retrieved_contexts[:3])[:1000]
+            faith_response = self.llm.invoke(faith_prompt.format(context=faith_context, answer=answer))
+            faith_data = self._parse_json_response(faith_response.content)
+            results["faithfulness"] = faith_data.get("score", 0.0)
+            results["faithfulness_explanation"] = faith_data.get("explanation", "N/A")
+            
+            relev_prompt = PromptTemplate.from_template(
+                """Is the ANSWER relevant to the QUESTION? Rate 0-1 and explain.
+QUESTION:
+{question}
+ANSWER:
+{answer}
+Respond in JSON:
+{{
+  "score": float,
+  "explanation": str
+}}"""
             )
-            relev_resp = self.eval_llm.invoke(relev_prompt).content.strip()
-            results["relevance"] = extract_score_from_text(relev_resp)
-
-            # Hallucination
-            hall_prompt = EVAL_PROMPTS["hallucination"].format(
-                context="\n".join(retrieved_contexts[:3]),
-                answer=answer
-            )
-            hall_resp = self.eval_llm.invoke(hall_prompt).content.strip()
-            results["has_hallucination"] = "yes" in hall_resp.lower()
-            results["hallucination_severity"] = safe_json_parse(hall_resp).get("severity", "none")
-
-            # Context Precision
+            
+            relev_response = self.llm.invoke(relev_prompt.format(question=query, answer=answer))
+            relev_data = self._parse_json_response(relev_response.content)
+            results["relevance"] = relev_data.get("score", 0.0)
+            results["relevance_explanation"] = relev_data.get("explanation", "N/A")
+            
             context_relevance = []
             for ctx in retrieved_contexts:
                 if not ctx.strip():
                     context_relevance.append(0.0)
                     continue
-                ctx_prompt = EVAL_PROMPTS["context_relevance"].format(
-                    question=query,
-                    context=ctx[:500]
+                
+                ctx_prompt = PromptTemplate.from_template(
+                    """Is this CONTEXT relevant to the QUESTION? Rate 0-1.
+QUESTION:
+{question}
+CONTEXT:
+{context}
+Respond with a number between 0 and 1"""
                 )
-                ctx_resp = self.eval_llm.invoke(ctx_prompt).content.strip()
-                context_relevance.append(extract_score_from_text(ctx_resp))
+                
+                try:
+                    ctx_response = self.llm.invoke(ctx_prompt.format(question=query, context=ctx[:500]))
+                    score = float(ctx_response.content.strip())
+                    context_relevance.append(score)
+                except:
+                    context_relevance.append(0.0)
+            
             results["context_precision"] = sum(context_relevance) / len(context_relevance) if context_relevance else 0.0
-
-            # Performance Metrics
-            results["eval_latency_ms"] = (time.time() - start_time) * 1000
-            results["total_latency_ms"] = metadata.get("latency_ms", 0)
-
-            # Failure Analysis
-            results["failure_category"] = classify_failure(
-                faithfulness=results["faithfulness"],
-                relevance=results["relevance"],
-                has_hallucination=results["has_hallucination"],
-                latency_ms=results["total_latency_ms"],
-                error=None,
-                thresholds=self.config
+            
+            halluc_prompt = PromptTemplate.from_template(
+                """Does the ANSWER contain claims not supported by the CONTEXT? If yes, identify them.
+CONTEXT:
+{context}
+ANSWER:
+{answer}
+Respond in JSON:
+{{
+  "has_hallucination": bool,
+  "hallucinated_claims": str,
+  "severity": str
+}}"""
             )
-
-            # Additional Metadata
-            results.update({
-                "retrieval_method_used": metadata.get("retrieval_method_used", "unknown"),
-                "config_features": metadata.get("config_features", []),
-                "token_estimate": calculate_token_estimate(query + answer + "\n".join(retrieved_contexts))
-            })
-
-            # Log if enabled
-            if self.config.get("log_all_queries", False):
-                log_to_jsonl(results, self.log_path)
-
-            # Update session metrics
-            self.session_metrics.append(results)
+            
+            halluc_response = self.llm.invoke(halluc_prompt.format(context=faith_context, answer=answer))
+            halluc_data = self._parse_json_response(halluc_response.content)
+            results["has_hallucination"] = halluc_data.get("has_hallucination", False)
+            results["hallucinated_claims"] = halluc_data.get("hallucinated_claims", "None")
+            results["hallucination_severity"] = halluc_data.get("severity", "none")
+            
+            try:
+                if len(retrieved_contexts) > 1:
+                    ctx_embs = self.embeddings.embed_documents([c for c in retrieved_contexts if c.strip()])
+                    if len(ctx_embs) > 1:
+                        sims = []
+                        for i in range(len(ctx_embs)):
+                            for j in range(i + 1, len(ctx_embs)):
+                                sim = cosine_similarity([ctx_embs[i]], [ctx_embs[j]])[0][0]
+                                sims.append(sim)
+                        results["context_diversity"] = 1 - (sum(sims) / len(sims)) if sims else 1.0
+                    else:
+                        results["context_diversity"] = 1.0
+                else:
+                    results["context_diversity"] = 1.0
+            except Exception as e:
+                logger.warning(f"Context diversity eval failed: {e}")
+                results["context_diversity"] = "N/A"
+            
+            results["metadata"] = metadata
+            results["failure_category"] = self._detect_failure_category(results)
+            results["eval_latency_ms"] = (time.time() - start_time) * 1000
+            
             self.total_queries += 1
-
+            if results["faithfulness"] < 0.5 or results["relevance"] < 0.5 or results["has_hallucination"]:
+                self.failures += 1
+            
             return results
-
+            
         except Exception as e:
-            logger.error(f"Evaluation failed for query {query_id}: {e}")
-            results.update({
-                "faithfulness": 0.0,
-                "relevance": 0.0,
-                "context_precision": 0.0,
-                "has_hallucination": False,
-                "hallucination_severity": "none",
-                "failure_category": "error",
-                "error_message": str(e),
-                "eval_latency_ms": (time.time() - start_time) * 1000
-            })
-            log_to_jsonl(results, self.log_path)
+            logger.error(f"Evaluation failed: {e}")
+            self.failures += 1
+            results["error"] = str(e)
+            results["eval_latency_ms"] = (time.time() - start_time) * 1000
             return results
-
-    def run_batch_evaluation(self, test_cases: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Run evaluation on a batch of test cases"""
-        batch_results = []
-        for test_case in test_cases:
-            query = test_case.get("query", "")
-            answer = test_case.get("answer", "")
-            contexts = test_case.get("contexts", [])
-            metadata = test_case.get("metadata", {})
-            result = self.evaluate_response(query, answer or "N/A", contexts, metadata)
-            batch_results.append(result)
-
-        aggregated = aggregate_metrics(batch_results)
-        summary = create_evaluation_summary(aggregated, self.config)
-        summary["individual_results"] = batch_results
-        return summary
-
+    
+    def _parse_json_response(self, response: str) -> Dict:
+        """Parse JSON response from LLM, with fallback"""
+        try:
+            return json.loads(response)
+        except:
+            logger.warning(f"Failed to parse JSON: {response}")
+            return {}
+    
+    def _detect_failure_category(self, results: Dict) -> str:
+        """Determine failure category based on metrics"""
+        if results.get("error"):
+            return "system_error"
+        if results.get("has_hallucination", False):
+            return "hallucination"
+        if results.get("faithfulness", 1.0) < 0.5:
+            return "low_faithfulness"
+        if results.get("relevance", 1.0) < 0.5:
+            return "low_relevance"
+        if results.get("context_precision", 1.0) < 0.5:
+            return "low_context_precision"
+        return "none"
+    
     def track_component_latency(self, component: str, latency_ms: float):
-        """Track latency for specific components"""
-        if component in self.component_latencies:
-            self.component_latencies[component].append(latency_ms)
-
+        """Track latency for retrieval, generation, or evaluation"""
+        if component in self.latency_metrics:
+            self.latency_metrics[component].append(latency_ms)
+    
     def track_cache_hit(self, cache_hit: bool):
-        """Track cache hit/miss"""
+        """Track cache hit rate"""
         if cache_hit:
             self.cache_hits += 1
-
+    
     def get_session_stats(self) -> Dict[str, Any]:
-        """Get session-level statistics"""
+        """Return session-wide statistics"""
         return {
             "total_queries": self.total_queries,
             "cache_hit_rate": self.cache_hits / self.total_queries if self.total_queries > 0 else 0.0,
-            "failure_rate": len([m for m in self.session_metrics if m.get("failure_category")]) / self.total_queries if self.total_queries > 0 else 0.0,
-            "avg_metrics": aggregate_metrics(self.session_metrics)
+            "failure_rate": self.failures / self.total_queries if self.total_queries > 0 else 0.0,
+            "avg_retrieval_latency_ms": sum(self.latency_metrics["retrieval"]) / len(self.latency_metrics["retrieval"]) if self.latency_metrics["retrieval"] else 0.0,
+            "avg_generation_latency_ms": sum(self.latency_metrics["generation"]) / len(self.latency_metrics["generation"]) if self.latency_metrics["generation"] else 0.0,
+            "avg_evaluation_latency_ms": sum(self.latency_metrics["evaluation"]) / len(self.latency_metrics["evaluation"]) if self.latency_metrics["evaluation"] else 0.0
         }
-
-    def get_real_time_metrics(self, window_minutes: int = 10) -> Dict[str, Any]:
-        """Get metrics for recent queries within a time window"""
-        cutoff_time = time.time() - (window_minutes * 60)
-        recent_metrics = [
-            m for m in self.session_metrics
-            if datetime.strptime(m["timestamp"], '%Y-%m-%d %H:%M:%S').timestamp() > cutoff_time
-        ]
-        return aggregate_metrics(recent_metrics)
-
+    
     def check_alerts(self) -> List[str]:
-        """Check for quality or performance issues and return alerts"""
+        """Check for performance issues and return alerts"""
         alerts = []
-        recent_metrics = self.get_real_time_metrics(window_minutes=10)
-        if self.config.get("alert_on_low_quality", False):
-            if recent_metrics.get("avg_faithfulness", 1.0) < self.config.get("min_faithfulness_score", 0.7):
-                alerts.append("Low faithfulness detected")
-            if recent_metrics.get("avg_relevance", 1.0) < self.config.get("min_relevance_score", 0.7):
-                alerts.append("Low relevance detected")
-        if self.config.get("alert_on_high_error_rate", False):
-            if recent_metrics.get("failure_rate", 0.0) > self.config.get("error_rate_threshold", 0.05):
-                alerts.append("High error rate detected")
+        stats = self.get_session_stats()
+        
+        if stats["failure_rate"] > 0.3:
+            alerts.append(f"High failure rate: {stats['failure_rate']:.1%}")
+        
+        if stats["cache_hit_rate"] < 0.1 and self.total_queries > 10:
+            alerts.append("Low cache hit rate: consider enabling caching")
+        
+        if stats["avg_evaluation_latency_ms"] > 5000:
+            alerts.append("High evaluation latency: consider disabling advanced evaluation")
+        
         return alerts
+    
+    def run_batch_evaluation(self, test_cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Run evaluation on a batch of test cases"""
+        results = []
+        for case in test_cases:
+            result = self.evaluate_response(
+                query=case["query"],
+                answer=case.get("answer", ""),
+                retrieved_contexts=case["contexts"],
+                metadata=case.get("metadata", {})
+            )
+            results.append(result)
+        
+        return {
+            "batch_results": results,
+            "summary": {
+                "avg_faithfulness": sum(r.get("faithfulness", 0) for r in results) / len(results) if results else 0,
+                "avg_relevance": sum(r.get("relevance", 0) for r in results) / len(results) if results else 0,
+                "avg_context_precision": sum(r.get("context_precision", 0) for r in results) / len(results) if results else 0,
+                "hallucination_rate": sum(1 for r in results if r.get("has_hallucination", False)) / len(results) if results else 0
+            }
+        }
